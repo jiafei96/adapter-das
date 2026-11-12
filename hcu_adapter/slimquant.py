@@ -51,7 +51,8 @@ import torch
 logger = logging.getLogger(__name__)
 
 _ROUTED_EXPERT_RE = re.compile(
-    r"\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)\.weight$"
+    r"(?:\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)"
+    r"|\.block_sparse_moe\.experts\.\d+\.w[123])\.weight$"
 )
 
 
@@ -394,6 +395,26 @@ def _invoke_w4a8(
     )
 
 
+def _apply_gated_activation(gate, up, activation, gemm1_alpha, gemm1_clamp_limit):
+    import torch.nn.functional as F
+
+    if activation == "silu":
+        return F.silu(gate) * up
+    if activation == "situ":
+        beta = 1.0 if gemm1_alpha is None else float(gemm1_alpha)
+        gate_f = gate.float()
+        up_f = up.float()
+        gated = beta * torch.tanh(gate_f / beta) * torch.sigmoid(gate_f)
+        if gemm1_clamp_limit is not None:
+            linear_beta = float(gemm1_clamp_limit)
+            up_f = linear_beta * torch.tanh(up_f / linear_beta)
+        return (gated * up_f).to(gate.dtype)
+    raise NotImplementedError(
+        f"fused_experts_w4a8: activation {activation!r} not implemented "
+        f"(supported: silu, situ)"
+    )
+
+
 def fused_experts_w4a8(
     hidden_states,
     w13_q,  # int8 [E, 2I, H//2]
@@ -404,6 +425,9 @@ def fused_experts_w4a8(
     topk_ids,
     routed_scaling_factor=None,
     inplace=False,
+    activation="silu",
+    gemm1_alpha=None,
+    gemm1_clamp_limit=None,
 ):
     import torch.nn.functional as F
     import triton
@@ -463,13 +487,15 @@ def fused_experts_w4a8(
         compute_type=compute_type,
     )
 
-    # activation: silu(gate) * up. The stacked loader writes w13 as chunk
-    # [gate; up] rows (w1 offset 0 / w3 offset I); sglang's plain-silu triton
-    # runner is chunk-semantic too (silu_and_mul(cache.view(-1, N))) --
+    # activation: silu(gate) * up by default. The stacked loader writes w13
+    # as chunk [gate; up] rows (w1 offset 0 / w3 offset I); sglang's plain-silu
+    # triton runner is chunk-semantic too (silu_and_mul(cache.view(-1, N))) --
     # gate_up_interleaved is only consumed by the gpt-oss alpha swiglu branch.
     c1 = cache1.view(num_tokens * top_k, N2)
     gate, up = c1[:, :I], c1[:, I:]
-    inter = torch.nn.functional.silu(gate) * up  # [tokens*topk, I] bf16
+    inter = _apply_gated_activation(
+        gate, up, activation, gemm1_alpha, gemm1_clamp_limit
+    )
 
     # down GEMM with routed weight multiply
     a2_q, a2_scale = _per_token_group_quant_int8(inter)
@@ -580,6 +606,9 @@ def register_quant_config():
             layer.register_parameter("w13_input_scale", None)
             layer.register_parameter("w2_input_scale", None)
 
+        def create_moe_runner(self, layer, moe_runner_config):
+            self.moe_runner_config = moe_runner_config
+
         def apply(self, layer, dispatch_output):
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -590,6 +619,7 @@ def register_quant_config():
             # (dsv2: "not _is_cuda and not _is_musa and not _use_aiter" ->
             # final *= routed_scaling_factor), so an in-kernel multiply would
             # double it (6.25x = 2.5^2 per layer).
+            rc = self.moe_runner_config
             out = fused_experts_w4a8(
                 x,
                 layer.w13_weight,
@@ -598,6 +628,9 @@ def register_quant_config():
                 layer.w2_weight_scale,
                 topk_output.topk_weights,
                 topk_output.topk_ids,
+                activation=rc.activation,
+                gemm1_alpha=rc.gemm1_alpha,
+                gemm1_clamp_limit=rc.gemm1_clamp_limit,
             )
             return StandardCombineInput(hidden_states=out)
 

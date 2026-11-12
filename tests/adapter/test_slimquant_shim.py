@@ -28,30 +28,38 @@ S_KEY = Q_KEY + "_scale"
 NORM_KEY = "model.layers.0.input_layernorm.weight"
 EXP_W_KEY = "model.layers.0.mlp.experts.3.down_proj.weight"
 EXP_S_KEY = EXP_W_KEY + "_scale"
+# Kimi-K3 packs routed experts as block_sparse_moe.experts.<i>.w{1,2,3}
+K3_W_KEY = "model.layers.1.block_sparse_moe.experts.0.w1.weight"
+K3_S_KEY = K3_W_KEY + "_scale"
+K3_UP_KEY = "model.layers.1.block_sparse_moe.experts.0.w3.weight"
+K3_UP_S_KEY = K3_UP_KEY + "_scale"
+K3_SHARED_KEY = "model.layers.1.block_sparse_moe.shared_experts.gate_proj.weight"
+K3_SHARED_S_KEY = K3_SHARED_KEY + "_scale"
 
 _W = torch.tensor([[127, -128, 3, 0]], dtype=torch.int8)
 _S = torch.tensor([[0.03125]], dtype=torch.bfloat16)
 _NORM = torch.linspace(-1, 1, 4, dtype=torch.bfloat16).unsqueeze(0)
 _EXP_W = torch.tensor([[13, -14, 15, -16], [1, 2, 3, 4]], dtype=torch.int8)
 _EXP_S = torch.tensor([[0.5], [0.25]], dtype=torch.bfloat16)
+_K3_W = torch.tensor([[0x12, 0x34], [-15, -114]], dtype=torch.int8)
+_K3_S = torch.tensor([[0.001]], dtype=torch.float32)
 
 
-def _make_ckpt(root, quant_config):
+def _make_ckpt(root, quant_config, extra=None):
     (root / "shard").mkdir(parents=True, exist_ok=True)
     cfg = {"architectures": ["FakeForCausalLM"]}
     if quant_config is not None:
         cfg["quantization_config"] = quant_config
     (root / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
-    save_file(
-        {
-            Q_KEY: _W.clone(),
-            S_KEY: _S.clone(),
-            NORM_KEY: _NORM.clone(),
-            EXP_W_KEY: _EXP_W.clone(),
-            EXP_S_KEY: _EXP_S.clone(),
-        },
-        str(root / "shard" / "model-00001.safetensors"),
-    )
+    tensors = {
+        Q_KEY: _W.clone(),
+        S_KEY: _S.clone(),
+        NORM_KEY: _NORM.clone(),
+        EXP_W_KEY: _EXP_W.clone(),
+        EXP_S_KEY: _EXP_S.clone(),
+    }
+    tensors.update(extra or {})
+    save_file(tensors, str(root / "shard" / "model-00001.safetensors"))
     return root / "shard" / "model-00001.safetensors"
 
 
@@ -105,6 +113,39 @@ def test_ct_float_checkpoint_passthrough(tmp_path):
 def test_slimquant_checkpoint_transforms(tmp_path):
     path = _make_ckpt(tmp_path / "sq", {"format": "slimquant_w4a8"})
     _assert_transformed(_open(path))
+
+
+def test_kimi_k3_packed_experts_keep_int4(tmp_path):
+    # Kimi-K3 names routed experts block_sparse_moe.experts.<i>.w{1,3}.
+    # Missing them makes the shim dequantize packed int4 as W8 and copy_ the
+    # bf16 result into an int8 param -> all-zero experts -> degenerate logits.
+    extra = {
+        K3_W_KEY: _K3_W.clone(),
+        K3_S_KEY: _K3_S.clone(),
+        K3_UP_KEY: _K3_W.clone(),
+        K3_UP_S_KEY: _K3_S.clone(),
+        K3_SHARED_KEY: _K3_W.clone(),
+        K3_SHARED_S_KEY: _K3_S.clone(),
+    }
+    path = _make_ckpt(
+        tmp_path / "k3", {"quant_method": "slimquant_w4a8"}, extra=extra
+    )
+    f = _open(path)
+
+    assert K3_S_KEY in f.keys(), "K3 expert scale dropped from keys()"
+    assert K3_UP_S_KEY in f.keys(), "K3 w3 scale dropped from keys()"
+    for k, s in ((K3_W_KEY, K3_S_KEY), (K3_UP_KEY, K3_UP_S_KEY)):
+        w = f.get_tensor(k)
+        assert w.dtype == torch.int8 and torch.equal(w, _K3_W), (
+            f"{k}: packed int4 dequantized instead of passed through"
+        )
+        assert torch.equal(f.get_tensor(s), _K3_S * 16.0), f"{s}: expected x16"
+
+    # dense/shared projections stay plain W8 -> dequantized bf16, scale hidden
+    assert K3_SHARED_S_KEY not in f.keys()
+    shared = f.get_tensor(K3_SHARED_KEY)
+    assert shared.dtype == torch.bfloat16, "shared expert should dequant to bf16"
+    assert torch.equal(shared, (_K3_W.float() * _K3_S).to(torch.bfloat16))
 
 
 def test_slimquant_method_field_transforms(tmp_path):

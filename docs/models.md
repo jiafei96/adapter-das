@@ -190,6 +190,37 @@
   `merge_state_v2` 报错、无后续异常。全量 93 层随后在双机 TP16 上加载完成、
   服务就绪、请求 200（2026-11-12）；精度与 DFLASH 投机未验。
 
+### 2026-11-12 Kimi-K3.1-Pro INT4-w4a8 输出全 `!` 的两个根因（nmz20/nmz22 双机 TP16）
+
+- **症状**：93 层全量加载成功、`/health` 200、请求也 200，但生成恒为 `!`（argmax 钉死在
+  vocab 0）。不是崩溃，是整模型退化。
+- **根因 1（shim 命名漏配，致命）**：`_ROUTED_EXPERT_RE` 只认 GLM/DeepSeek 的
+  `.mlp.experts.N.{gate_proj,up_proj,down_proj}.weight`。K3 的路由专家叫
+  `block_sparse_moe.experts.N.w{1,2,3}.weight`，于是打包 int4 的 `[3072,1792]` I8
+  张量落进 W8 反量化分支：`(w.float()*s).to(bf16)` 得到 bf16 值，`copy_` 进 int8
+  参数时被截断为全零，`_keep` 又把 `_scale` 从 `keys()` 里滤掉。结果 93 层 × 全部
+  路由专家 **zeros fraction = 1.0**，MoE 输出恒零 → logits 退化 → `!`。
+  修复：正则扩为 `(?:\.mlp\.experts\.\d+\.(?:gate_proj|up_proj|down_proj)|\.block_sparse_moe\.experts\.\d+\.w[123])\.weight$`。
+- **根因 2（激活函数写死，非致命但必错）**：`fused_experts_w4a8` 里硬编码
+  `F.silu(gate) * up`，而 K3 是 SituGLU（`hidden_act="situ"`,
+  `activation_situ_beta=4.0`, `activation_situ_linear_beta=25.0`）。上游
+  `SituAndMul.forward_native` 为 `beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)`。
+  修复：抽出 `_apply_gated_activation`，`HcuW4A8MoEMethod.create_moe_runner` 存下
+  `moe_runner_config`，`apply()` 转发 `rc.activation` / `rc.gemm1_alpha` /
+  `rc.gemm1_clamp_limit`。未知激活名抛 `NotImplementedError` 而不是静默退回 silu。
+- **排除项**（都实测过，不是病因）：
+  - `routed_scaling_factor` 在本 checkpoint 上是 1.0，且 adapter 的
+    `should_fuse_routed_scaling_factor_in_topk` 为 False，模型在外面乘——内核内不乘是对的；
+  - nibble 序 / scale ÷16：adapter kernel 本来就按磁盘布局实现（偶 k 高 nibble、补码、
+    scale/16 → ×16），实测 `int4*S*16` absmean 0.019036 对共享专家 W8 参考 0.014539，量级吻合；
+  - 共享专家 / dense MLP / attn 投影在本 checkpoint 里确实是纯 W8，bf16 反量化路径正确。
+- **仍未证**：24 层 × 5 个 `self_attn.indexer.*` 张量无人消费（`grep -c indexer kimi_k3.py`
+  为 0），DSA `index_topk=2048` 实际没生效——架构偏差属实，但与本次 `!` 崩塌的因果关系未验证。
+- **单测**：`tests/adapter/test_slimquant_shim.py::test_kimi_k3_packed_experts_keep_int4`
+  锁 shim 面（int4 透传 + scale ×16 + 共享专家仍反量化）；`tests/adapter/test_slimquant_w4a8_activation.py`
+  锁 situ 数值对齐上游公式、与 silu 有差异、无 `linear_beta` 时不裁 up、未知激活名报错。
+- **验证状态**：单测全过；端到端精度待空闲机器验证。
+
 ### 10-23 夜 engram host 路三层根因破案 + 修复全通（validation-host-26 卡2, cut8 TP1）
 - **症状链**：host 表 boot → 建表/注册全"成功" → 首次 GPU 触表必 KERNEL VMFault（shared 崩在建表 canary、per_rank 崩在首请求）；单元级同序列 5/5 全过——单元与 server 行为分裂。
 - **三层根因（叠罗汉，逐层剥）**：①multi 单测复现是我脚本 mmap 局部变量 GC 悬空假象；②cut8 剪层破了 id 空间不变式（shared 分支 gather 不设界 + id 上限=Σ24 素数，fault VA 散布表上方 20G 与 dmesg 精确吻合；device 路不崩=越界落相邻 VRAM）；③**真凶=platform_seam 强制 is_hip()=False → engram.py 指针翻译短路 return host_ptr，hipHostGetDevicePointer 从未被调用**（v11 教训同款陷阱：seam 语义下 HIP 判定不可信）。
